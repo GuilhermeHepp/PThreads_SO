@@ -1,0 +1,18 @@
+{
+  "configurations": [
+    {
+      "name": "MSYS2-UCRT64",
+      "includePath": [
+        "${workspaceFolder}/**",
+        "C:/msys64/ucrt64/include",
+        "C:/msys64/ucrt64/lib/gcc/x86_64-w64-mingw32/14.1.0/include",
+        "C:/msys64/ucrt64/x86_64-w64-mingw32/include"
+      ],
+      "defines": [],
+      "compilerPath": "C:/msys64/ucrt64/bin/gcc.exe",
+      "cStandard": "c11",
+      "intelliSenseMode": "windows-gcc-x64"
+    }
+  ],
+  "version": 4
+}
