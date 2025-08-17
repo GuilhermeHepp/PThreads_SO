@@ -7,13 +7,14 @@
 #include <time.h>
 #include <errno.h>
 
-#define TEMPO_TOTAL (60 * 2) // Simulação de 2 minutos
-#define MAX_AVIOES 100
+// --- PARÂMETROS DA SIMULAÇÃO ---
+#define TEMPO_TOTAL (60 * 5) // Simulação de 5 minutos
+#define MAX_AVIOES 500       // Limite de aviões a serem criados
 
-// controle global
+// --- CONTROLE GLOBAL ---
 volatile int simulacaoAtiva = 1;
 
-// métricas e mutexes
+// --- MÉTRICAS E MUTEXES ---
 int avioesEmOperacao = 0;
 int picoAvioesSimultaneos = 0;
 long long somaTemposOperacao = 0;
@@ -30,29 +31,29 @@ pthread_mutex_t mutexContadores;
 int deadlocksOcorridos = 0;
 pthread_mutex_t mutexMonitor;
 
-// semáforos recursos
+// --- RECURSOS DO AEROPORTO (SEMÁFOROS) ---
 sem_t semPistas;
 sem_t semPortoes;
 sem_t semTorre;
 
-// avião
+// --- ESTRUTURA DO AVIÃO ---
 struct aviao {
     int id;
     int tipo; // 0 doméstico, 1 internacional
     int tempoDeOperacao;
     int entrouEmAlerta;
-    time_t tempoDeEsperaTorre; // 0 se não está esperando
     pthread_mutex_t mutexAviao;
+    int emEstadoCritico; 
+    int anunciouPrioridade; 
 };
 
-// args monitor
+// --- ESTRUTURA PARA O MONITOR ---
 struct monitor_args {
     struct aviao* avioes;
-    pthread_t* threads;
     int numAvioesCriados;
 };
 
-// helper: sem_timedwait por segundos (retorna 0 se obteve, -1 e errno==ETIMEDOUT se timeout)
+// Função auxiliar para esperar um semáforo com timeout em segundos
 int sem_wait_seconds(sem_t *s, int seconds) {
     struct timespec ts;
     if (clock_gettime(CLOCK_REALTIME, &ts) == -1) return -1;
@@ -60,65 +61,35 @@ int sem_wait_seconds(sem_t *s, int seconds) {
     while (1) {
         int r = sem_timedwait(s, &ts);
         if (r == 0) return 0;
-        if (errno == EINTR) continue; // retry if interrupted
-        return -1; // either ETIMEDOUT or other error
+        if (errno == EINTR) continue;
+        return -1;
     }
 }
 
-// MODIFICAÇÃO: A função agora retorna int (0 para sucesso, -1 para falha/queda)
+/**
+ * @brief Simula a operação de pouso. VERSÃO FINAL E CORRIGIDA.
+ * A lógica de prioridade agora permite que o avião crítico tenha uma chance real de pousar.
+ * @return 0 em caso de sucesso, -1 em caso de falha.
+ */
 int pousar(struct aviao *a) {
     int obteveTorre = 0;
     int obtevePista = 0;
-
-    // Se a simulação já terminou, não tenta nem iniciar a operação.
     if (!simulacaoAtiva) return -1;
 
-    if (a->tipo == 1) { // Internacional: Pista -> Torre
-        time_t inicio = time(NULL);
-        while (!(obtevePista && obteveTorre) && simulacaoAtiva) {
-            if (!obtevePista) {
-                if (sem_wait_seconds(&semPistas, 1) == 0) obtevePista = 1;
-            }
-            if (obtevePista && !obteveTorre) {
-                if (sem_wait_seconds(&semTorre, 1) == 0) obteveTorre = 1;
-                else { // Não conseguiu torre, libera pista para evitar deadlock
-                    sem_post(&semPistas);
-                    obtevePista = 0;
-                }
-            }
-            
-            // Lógica de alerta para voos internacionais também, para registro
-            if (time(NULL) - inicio >= 60 && !a->entrouEmAlerta) {
-                pthread_mutex_lock(&mutexContadores);
-                if (!a->entrouEmAlerta) { // Double check para evitar race condition
-                    a->entrouEmAlerta = 1;
-                    avioesAlerta++;
-                    printf("Aviao %d (Internacional) em alerta critico [pouso]\n", a->id);
-                }
-                pthread_mutex_unlock(&mutexContadores);
-            }
-        }
-    } else { // Doméstico: Torre -> Pista
-        time_t inicio = time(NULL);
-        while (!(obteveTorre && obtevePista) && simulacaoAtiva) {
-            if (!obteveTorre) {
-                if (sem_wait_seconds(&semTorre, 1) == 0) obteveTorre = 1;
-            }
-            if (obteveTorre && !obtevePista) {
-                if (sem_wait_seconds(&semPistas, 1) == 0) obtevePista = 1;
-                else { // Não conseguiu pista, libera torre para evitar deadlock
-                    sem_post(&semTorre);
-                    obteveTorre = 0;
-                }
-            }
+    time_t inicioEspera = time(NULL);
 
-            int espera = time(NULL) - inicio;
+    while (!(obtevePista && obteveTorre) && simulacaoAtiva) {
+        
+        if (a->tipo == 0) { // Timer de fome e estado crítico SÓ para DOMÉSTICOS
+            int espera = time(NULL) - inicioEspera;
             if (espera >= 60 && !a->entrouEmAlerta) {
                 pthread_mutex_lock(&mutexContadores);
-                if(!a->entrouEmAlerta) {
+                if (!a->entrouEmAlerta) {
                     a->entrouEmAlerta = 1;
                     avioesAlerta++;
+                    a->emEstadoCritico = 1; 
                     printf("Aviao %d (Domestico) em alerta critico (esperando ha %ds) [pouso]\n", a->id, espera);
+                    fflush(stdout);
                 }
                 pthread_mutex_unlock(&mutexContadores);
             }
@@ -127,14 +98,63 @@ int pousar(struct aviao *a) {
                 avioesCaidos++;
                 pthread_mutex_unlock(&mutexContadores);
                 printf("!!! Aviao %d (Domestico) CAIU apos 90s esperando por recursos para pouso.\n", a->id);
+                fflush(stdout);
                 if (obteveTorre) sem_post(&semTorre);
-                // MODIFICAÇÃO: Retorna -1 para sinalizar a falha catastrófica
+                if (obtevePista) sem_post(&semPistas);
                 return -1;
+            }
+        }
+
+        // --- ESTRATÉGIA DE ALOCAÇÃO ---
+        
+        // Estratégia para Internacionais (sempre prioritária)
+        if (a->tipo == 1) {
+            if (!obtevePista) {
+                if (sem_wait_seconds(&semPistas, 1) == 0) obtevePista = 1;
+            }
+            if (obtevePista && !obteveTorre) {
+                if (sem_wait_seconds(&semTorre, 1) == 0) obteveTorre = 1;
+                else {
+                    sem_post(&semPistas);
+                    obtevePista = 0;
+                }
+            }
+        } 
+        // Estratégia para Domésticos (muda se ficar crítico)
+        else { 
+            if (a->emEstadoCritico == 1) { // Lógica Prioritária para Doméstico Crítico
+                if (a->anunciouPrioridade == 0) {
+                     printf("--- Aviao %d (Domestico CRITICO) tentando pouso prioritario ---\n", a->id);
+                     fflush(stdout);
+                     a->anunciouPrioridade = 1;
+                }
+                // Tenta pegar o que falta, usando a ordem Pista -> Torre
+                if (!obtevePista) {
+                    if (sem_wait_seconds(&semPistas, 1) == 0) obtevePista = 1;
+                }
+                if (obtevePista && !obteveTorre) {
+                    if (sem_wait_seconds(&semTorre, 1) == 0) obteveTorre = 1;
+                    else {
+                        sem_post(&semPistas);
+                        obtevePista = 0;
+                    }
+                }
+            } else { // Lógica Padrão para Doméstico normal
+                // Tenta pegar o que falta, usando a ordem Torre -> Pista
+                if (!obteveTorre) {
+                    if (sem_wait_seconds(&semTorre, 1) == 0) obteveTorre = 1;
+                }
+                if (obteveTorre && !obtevePista) {
+                    if (sem_wait_seconds(&semPistas, 1) == 0) obtevePista = 1;
+                    else {
+                        sem_post(&semTorre);
+                        obteveTorre = 0;
+                    }
+                }
             }
         }
     }
 
-    // Se saiu do loop porque a simulação acabou, libera o que conseguiu e retorna falha
     if (!(obtevePista && obteveTorre)) {
         if (obtevePista) sem_post(&semPistas);
         if (obteveTorre) sem_post(&semTorre);
@@ -142,23 +162,22 @@ int pousar(struct aviao *a) {
     }
 
     printf("Aviao %d (%s) iniciou o pouso.\n", a->id, a->tipo == 0 ? "Domestico" : "Internacional");
+    fflush(stdout);
     sleep(a->tempoDeOperacao);
     printf("Aviao %d (%s) terminou o pouso.\n", a->id, a->tipo == 0 ? "Domestico" : "Internacional");
+    fflush(stdout);
 
     sem_post(&semTorre);
     sem_post(&semPistas);
-
-    return 0; // Sucesso
+    return 0;
 }
 
-// MODIFICAÇÃO: A função agora retorna int
 int desembarcar(struct aviao *a) {
     int obteveTorre = 0;
     int obtevePortao = 0;
-
     if (!simulacaoAtiva) return -1;
     
-    if (a->tipo == 1) { // Internacional: Portão -> Torre
+    if (a->tipo == 1) { 
         while (!(obtevePortao && obteveTorre) && simulacaoAtiva) {
             if (!obtevePortao) {
                 if (sem_wait_seconds(&semPortoes, 1) == 0) obtevePortao = 1;
@@ -171,7 +190,7 @@ int desembarcar(struct aviao *a) {
                 }
             }
         }
-    } else { // Doméstico: Torre -> Portão
+    } else { 
          time_t inicio = time(NULL);
         while (!(obteveTorre && obtevePortao) && simulacaoAtiva) {
             if (!obteveTorre) {
@@ -186,12 +205,13 @@ int desembarcar(struct aviao *a) {
             }
             int espera = time(NULL) - inicio;
             if (espera >= 60 && !a->entrouEmAlerta) {
-                 pthread_mutex_lock(&mutexContadores);
-                 if(!a->entrouEmAlerta){
+                pthread_mutex_lock(&mutexContadores);
+                if(!a->entrouEmAlerta){
                     a->entrouEmAlerta = 1;
                     avioesAlerta++;
-                    printf("Aviao %d (Domestico) em alerta critico (esperando ha %ds) [desembarque]\n", a->id, espera);
-                 }
+                    printf("Aviao %d (Domestico) esperando para desembarcar (esperando ha %ds)\n", a->id, espera);
+                    fflush(stdout);
+                }
                 pthread_mutex_unlock(&mutexContadores);
             }
         }
@@ -204,26 +224,23 @@ int desembarcar(struct aviao *a) {
     }
 
     printf("Aviao %d (%s) iniciou o desembarque.\n", a->id, a->tipo == 0 ? "Domestico" : "Internacional");
+    fflush(stdout);
     sleep(a->tempoDeOperacao);
     printf("Aviao %d (%s) terminou o desembarque.\n", a->id, a->tipo == 0 ? "Domestico" : "Internacional");
+    fflush(stdout);
 
     sem_post(&semTorre);
-    // De acordo com o PDF, o portão é liberado "após um tempo", aqui liberamos junto com a torre.
     sem_post(&semPortoes);
-
-    return 0; // Sucesso
+    return 0;
 }
 
-// MODIFICAÇÃO: A função agora retorna int e a lógica de alocação foi corrigida
 int decolar(struct aviao *a) {
     int obteveTorre = 0;
     int obtevePista = 0;
     int obtevePortao = 0;
-
     if (!simulacaoAtiva) return -1;
     
-    // Ordem para Internacional: Portão -> Pista -> Torre
-    if (a->tipo == 1) { // Internacional
+    if (a->tipo == 1) { 
         while (!(obtevePortao && obtevePista && obteveTorre) && simulacaoAtiva) {
              if (!obtevePortao) {
                 if (sem_wait_seconds(&semPortoes, 1) == 0) obtevePortao = 1;
@@ -245,8 +262,7 @@ int decolar(struct aviao *a) {
                 }
             }
         }
-    } else { // Doméstico
-        // Ordem para Doméstico: Torre -> Portão -> Pista
+    } else { 
         time_t inicio = time(NULL);
         while (!(obteveTorre && obtevePortao && obtevePista) && simulacaoAtiva) {
             if (!obteveTorre) {
@@ -268,14 +284,14 @@ int decolar(struct aviao *a) {
                     obteveTorre = 0;
                 }
             }
-            
             int espera = time(NULL) - inicio;
             if (espera >= 60 && !a->entrouEmAlerta) {
                 pthread_mutex_lock(&mutexContadores);
                 if(!a->entrouEmAlerta){
                    a->entrouEmAlerta = 1;
                    avioesAlerta++;
-                   printf("Aviao %d (Domestico) em alerta critico (esperando ha %ds) [decolagem]\n", a->id, espera);
+                   printf("Aviao %d (Domestico) esperando para decolar (esperando ha %ds)\n", a->id, espera);
+                   fflush(stdout);
                 }
                 pthread_mutex_unlock(&mutexContadores);
             }
@@ -290,95 +306,64 @@ int decolar(struct aviao *a) {
     }
 
     printf("Aviao %d (%s) iniciou a decolagem.\n", a->id, a->tipo == 0 ? "Domestico" : "Internacional");
+    fflush(stdout);
     sleep(a->tempoDeOperacao);
     printf("Aviao %d (%s) terminou a decolagem.\n", a->id, a->tipo == 0 ? "Domestico" : "Internacional");
+    fflush(stdout);
 
     sem_post(&semTorre);
     sem_post(&semPistas);
     sem_post(&semPortoes);
-    return 0; // Sucesso
+    return 0;
 }
 
-// thread do avião
 void *threadAviao(void *arg) {
     struct aviao *a = (struct aviao *)arg;
-
     struct timeval tstart, tend;
     gettimeofday(&tstart, NULL);
-
     pthread_mutex_lock(&mutexOperacao);
     avioesEmOperacao++;
     if (avioesEmOperacao > picoAvioesSimultaneos) picoAvioesSimultaneos = avioesEmOperacao;
     pthread_mutex_unlock(&mutexOperacao);
-
-    // MODIFICAÇÃO: Verifica o retorno de cada função. Se falhar, encerra a thread.
     if (pousar(a) != 0) {
-        // Se pousar falhou (caiu ou simulação acabou), a thread termina aqui.
         pthread_mutex_lock(&mutexOperacao);
         avioesEmOperacao--;
         pthread_mutex_unlock(&mutexOperacao);
         return NULL;
     }
-    
     if (desembarcar(a) != 0) {
-        // Se desembarcar falhou (simulação acabou), a thread termina.
         pthread_mutex_lock(&mutexOperacao);
         avioesEmOperacao--;
         pthread_mutex_unlock(&mutexOperacao);
         return NULL;
     }
-    
     if (decolar(a) != 0) {
-        // Se decolar falhou (simulação acabou), a thread termina.
         pthread_mutex_lock(&mutexOperacao);
         avioesEmOperacao--;
         pthread_mutex_unlock(&mutexOperacao);
         return NULL;
     }
-
-    // Se chegou até aqui, todas as operações foram um sucesso.
     gettimeofday(&tend, NULL);
     long long tempo = (tend.tv_sec - tstart.tv_sec) * 1000LL + (tend.tv_usec - tstart.tv_usec) / 1000;
-
     pthread_mutex_lock(&mutexContadores);
     avioesSucesso++;
     somaTemposOperacao += tempo;
     pthread_mutex_unlock(&mutexContadores);
-
     pthread_mutex_lock(&mutexOperacao);
     avioesEmOperacao--;
     pthread_mutex_unlock(&mutexOperacao);
-
     return NULL;
 }
 
-// Monitor de deadlock.
 void* threadMonitor(void* arg) {
     struct monitor_args* args = (struct monitor_args*)arg;
     struct aviao* avs = args->avioes;
-    
     while (simulacaoAtiva) {
-        sleep(5); // Checa a cada 5 segundos
+        sleep(5);
         pthread_mutex_lock(&mutexMonitor);
         int num_avioes = args->numAvioesCriados;
         for (int i = 0; i < num_avioes; i++) {
             pthread_mutex_lock(&avs[i].mutexAviao);
-            if (avs[i].tempoDeEsperaTorre > 0) {
-                time_t waited = time(NULL) - avs[i].tempoDeEsperaTorre;
-                // Um tempo muito longo de espera pode indicar um deadlock não resolvido pela estratégia cooperativa.
-                if (waited > 120) { 
-                    printf("\n>>> MONITOR: Deadlock potencial detectado! Aviao %d esperando ha mais de 120s. Encerrando simulacao.\n", avs[i].id);
-                    pthread_mutex_lock(&mutexContadores);
-                    deadlocksOcorridos++;
-                    pthread_mutex_unlock(&mutexContadores);
-
-                    simulacaoAtiva = 0; // Força o encerramento de tudo
-                    
-                    pthread_mutex_unlock(&avs[i].mutexAviao);
-                    pthread_mutex_unlock(&mutexMonitor);
-                    return NULL;
-                }
-            }
             pthread_mutex_unlock(&avs[i].mutexAviao);
         }
         pthread_mutex_unlock(&mutexMonitor);
@@ -391,72 +376,62 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Uso: %s <num_pistas> <num_portoes> <capacidade_torre>\n", argv[0]);
         return 1;
     }
-    
     srand(time(NULL));
-
     int numPistas = atoi(argv[1]);
     int numPortoes = atoi(argv[2]);
     int capacidadeTorre = atoi(argv[3]);
-
     sem_init(&semPistas, 0, numPistas);
     sem_init(&semPortoes, 0, numPortoes);
     sem_init(&semTorre, 0, capacidadeTorre);
-
     pthread_mutex_init(&mutexContadores, NULL);
     pthread_mutex_init(&mutexOperacao, NULL);
     pthread_mutex_init(&mutexMonitor, NULL);
-
     pthread_t* threads = malloc(sizeof(pthread_t) * MAX_AVIOES);
     struct aviao* avioes = malloc(sizeof(struct aviao) * MAX_AVIOES);
     if (!threads || !avioes) { perror("malloc"); return 1; }
-
     for (int j = 0; j < MAX_AVIOES; j++) {
         pthread_mutex_init(&avioes[j].mutexAviao, NULL);
     }
-
     struct monitor_args margs;
     margs.avioes = avioes;
-    margs.threads = threads;
     margs.numAvioesCriados = 0;
-
     pthread_t monitorThread;
     pthread_create(&monitorThread, NULL, threadMonitor, &margs);
-
     time_t inicio = time(NULL);
     int i = 0;
-
+    printf("Iniciando simulacao por %d segundos...\n", TEMPO_TOTAL);
+    fflush(stdout);
     while (time(NULL) - inicio < TEMPO_TOTAL && i < MAX_AVIOES && simulacaoAtiva) {
         avioes[i].id = i + 1;
         avioes[i].tipo = rand() % 2;
-        avioes[i].tempoDeOperacao = rand() % 3 + 1; // Operações de 1 a 3 segundos
+        avioes[i].tempoDeOperacao = rand() % 3 + 1;
         avioes[i].entrouEmAlerta = 0;
-        avioes[i].tempoDeEsperaTorre = 0;
-
+        avioes[i].emEstadoCritico = 0;
+        avioes[i].anunciouPrioridade = 0;
         pthread_mutex_lock(&mutexContadores);
         totalAvioes++;
         if (avioes[i].tipo == 0) totalDomesticos++;
         else totalInternacionais++;
         pthread_mutex_unlock(&mutexContadores);
-
         pthread_create(&threads[i], NULL, threadAviao, &avioes[i]);
         i++;
         margs.numAvioesCriados = i;
-
-        sleep(rand() % 4); // Novo avião a cada 0-3 segundos
+        sleep(rand() % 4);
     }
-
     printf("\n>>> TEMPO DE SIMULACAO ESGOTADO. Nao serao criados novos avioes. Aguardando operacoes em andamento... <<<\n\n");
-
-    // MODIFICAÇÃO: Sinaliza o fim da simulação ANTES de esperar as threads terminarem.
+    fflush(stdout);
     simulacaoAtiva = 0;
-
     for (int j = 0; j < i; j++) {
         pthread_join(threads[j], NULL);
     }
-
-    // Agora que as threads de avião terminaram, aguarda o monitor
     pthread_join(monitorThread, NULL);
-
+    char nome_arquivo[100];
+    sprintf(nome_arquivo, "relatorio_%dp_%dg_%dt.txt", numPistas, numPortoes, capacidadeTorre);
+    FILE *arquivo_relatorio;
+    arquivo_relatorio = fopen(nome_arquivo, "w");
+    if (arquivo_relatorio == NULL) {
+        fprintf(stderr, "Erro ao criar o arquivo de relatorio '%s'.\n", nome_arquivo);
+    }
     printf("\n--- RELATORIO FINAL ---\n");
     printf("Configuracao: %d Pistas, %d Portoes, %d Torre(s) de Controle\n", numPistas, numPortoes, capacidadeTorre);
     printf("----------------------------------------\n");
@@ -471,15 +446,40 @@ int main(int argc, char *argv[]) {
     printf("----------------------------------------\n");
     printf("Tempo total de simulacao (sec): %ld\n", time(NULL) - inicio);
     printf("Pico de avioes simultaneos em operacao: %d\n", picoAvioesSimultaneos);
+    if (arquivo_relatorio != NULL) {
+        fprintf(arquivo_relatorio, "--- RELATORIO FINAL ---\n");
+        fprintf(arquivo_relatorio, "Configuracao: %d Pistas, %d Portoes, %d Torre(s) de Controle\n", numPistas, numPortoes, capacidadeTorre);
+        fprintf(arquivo_relatorio, "----------------------------------------\n");
+        fprintf(arquivo_relatorio, "Total de avioes criados: %d\n", totalAvioes);
+        fprintf(arquivo_relatorio, " - Domesticos: %d\n", totalDomesticos);
+        fprintf(arquivo_relatorio, " - Internacionais: %d\n", totalInternacionais);
+        fprintf(arquivo_relatorio, "----------------------------------------\n");
+        fprintf(arquivo_relatorio, "Total de avioes que completaram o ciclo: %d\n", avioesSucesso);
+        fprintf(arquivo_relatorio, "Total de avioes que cairam (starvation): %d\n", avioesCaidos);
+        fprintf(arquivo_relatorio, "Total de avioes que entraram em alerta critico: %d\n", avioesAlerta);
+        fprintf(arquivo_relatorio, "Deadlocks detectados pelo monitor: %d\n", deadlocksOcorridos);
+        fprintf(arquivo_relatorio, "----------------------------------------\n");
+        fprintf(arquivo_relatorio, "Tempo total de simulacao (sec): %ld\n", time(NULL) - inicio);
+        fprintf(arquivo_relatorio, "Pico de avioes simultaneos em operacao: %d\n", picoAvioesSimultaneos);
+    }
     if (avioesSucesso > 0) {
         double media = somaTemposOperacao / (double)avioesSucesso;
         printf("Tempo medio de ciclo por aviao (sucesso): %.2f ms\n", media);
+        if (arquivo_relatorio != NULL) {
+            fprintf(arquivo_relatorio, "Tempo medio de ciclo por aviao (sucesso): %.2f ms\n", media);
+        }
     } else {
         printf("Nenhum aviao completou as operacoes com sucesso.\n");
+        if (arquivo_relatorio != NULL) {
+            fprintf(arquivo_relatorio, "Nenhum aviao completou as operacoes com sucesso.\n");
+        }
     }
     printf("--- FIM DO RELATORIO ---\n");
-
-    // limpeza
+    if (arquivo_relatorio != NULL) {
+        fprintf(arquivo_relatorio, "--- FIM DO RELATORIO ---\n");
+        fclose(arquivo_relatorio);
+        printf("\nRelatorio final tambem foi salvo em '%s'\n", nome_arquivo);
+    }
     for (int j = 0; j < MAX_AVIOES; j++) pthread_mutex_destroy(&avioes[j].mutexAviao);
     free(threads);
     free(avioes);
@@ -489,6 +489,5 @@ int main(int argc, char *argv[]) {
     pthread_mutex_destroy(&mutexContadores);
     pthread_mutex_destroy(&mutexOperacao);
     pthread_mutex_destroy(&mutexMonitor);
-
     return 0;
 }
