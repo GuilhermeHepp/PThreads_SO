@@ -1,0 +1,16 @@
+--- RELATORIO FINAL ---
+Configuracao: 3 Pistas, 5 Portoes, 2 Torre(s) de Controle
+----------------------------------------
+Total de avioes criados: 194
+ - Domesticos: 92
+ - Internacionais: 102
+----------------------------------------
+Total de avioes que completaram o ciclo: 12
+Total de avioes que cairam (starvation): 32
+Total de avioes que entraram em alerta critico: 68
+Deadlocks detectados pelo monitor: 0
+----------------------------------------
+Tempo total de simulacao (sec): 306
+Pico de avioes simultaneos em operacao: 151
+Tempo medio de ciclo por aviao (sucesso): 35702.33 ms
+--- FIM DO RELATORIO ---

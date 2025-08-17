@@ -66,11 +66,6 @@ int sem_wait_seconds(sem_t *s, int seconds) {
     }
 }
 
-/**
- * @brief Simula a operação de pouso. VERSÃO FINAL E CORRIGIDA.
- * A lógica de prioridade agora permite que o avião crítico tenha uma chance real de pousar.
- * @return 0 em caso de sucesso, -1 em caso de falha.
- */
 int pousar(struct aviao *a) {
     int obteveTorre = 0;
     int obtevePista = 0;
@@ -80,7 +75,7 @@ int pousar(struct aviao *a) {
 
     while (!(obtevePista && obteveTorre) && simulacaoAtiva) {
         
-        if (a->tipo == 0) { // Timer de fome e estado crítico SÓ para DOMÉSTICOS
+        if (a->tipo == 0) { 
             int espera = time(NULL) - inicioEspera;
             if (espera >= 60 && !a->entrouEmAlerta) {
                 pthread_mutex_lock(&mutexContadores);
